@@ -1,0 +1,45 @@
+name: Trae CN CheckIn
+
+# GitHub cron 为 UTC；00:30 UTC = 北京时间 08:30
+# 注意：GitHub 定时任务可能有数分钟延迟，且只在默认分支上生效
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅查询签到状态，不领取"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trae-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run Trae checkin
+        env:
+          TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+          TRAE_TOKEN: ${{ secrets.TRAE_TOKEN }}
+          TRAE_DEVICE_ID: ${{ secrets.TRAE_DEVICE_ID }}
+          TRAE_REGION: ${{ secrets.TRAE_REGION }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="--dry-run"; fi
+          python checkin_trae_actions.py $ARGS
