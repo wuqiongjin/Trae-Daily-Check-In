@@ -1,7 +1,8 @@
 name: Trae CN CheckIn
 
 # GitHub cron 为 UTC；00:30 UTC = 北京时间 08:30
-# 注意：GitHub 定时任务可能有数分钟延迟，且只在默认分支上生效
+# 08:30 触发后在 job 内随机 sleep 0~30 分钟，实现每天 08:30-09:00 随机签到
+# 注意：GitHub 定时触发本身可能有几分钟延迟（偶发更久），且只在默认分支上生效
 on:
   schedule:
     - cron: "30 0 * * *"
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +33,14 @@ jobs:
 
       - name: Install deps
         run: pip install requests
+
+      # 仅定时触发时随机延迟 0~1800s（08:30-09:00 窗口）；手动触发立即执行
+      - name: Random delay (08:30-09:00 CST window)
+        if: github.event_name == 'schedule'
+        run: |
+          DELAY=$((RANDOM % 1800))
+          echo "随机延迟 ${DELAY}s 后签到（目标窗口 08:30-09:00 北京时间）"
+          sleep "$DELAY"
 
       - name: Run Trae checkin
         env:
