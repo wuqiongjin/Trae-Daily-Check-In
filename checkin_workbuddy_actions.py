@@ -31,7 +31,8 @@ refreshToken 换新。为避免 refreshToken 链条中断，脚本会把刷新�
   python checkin_workbuddy_actions.py            # 正式签到（查状态 -> 未签则领取）
   python checkin_workbuddy_actions.py --dry-run  # 只查询签到状态，绝不领取（本地测试用）
   python checkin_workbuddy_actions.py --export   # 本机读取 WorkBuddy 登录态，生成 Secrets JSON
-                                                 # （Windows DPAPI 解密 CodeBuddy CN 的 state.vscdb，
+                                                 # （优先 Windows DPAPI 解密 CodeBuddy CN 的 state.vscdb；
+                                                 #   找不到则回退解密 CodeBuddyExtension 的 *.info 会话文件，
                                                  #   需 pycryptodome，且本机已登录 WorkBuddy/CodeBuddy CN）
 
 安全说明：
@@ -47,6 +48,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import time
 from pathlib import Path
@@ -68,6 +70,13 @@ WB_LOCAL_STATE_REL = Path("CodeBuddy CN") / "Local State"
 WB_VSCDB_REL = Path("CodeBuddy CN") / "User" / "globalStorage" / "state.vscdb"
 WB_SECRET_KEY = ('secret://{"extensionId":"tencent-cloud.coding-copilot",'
                  '"key":"planning-genie.new.accessTokencn"}')
+
+# 回退来源：WorkBuddy 桌面版把登录态放在 CodeBuddyExtension/Data/Public/auth/*.info，
+# 不在 CodeBuddy CN（VSCode 壳）数据目录里；敏感字段为 $wbEncrypted 信封加密
+# （AES-256-GCM），密钥由构建期内嵌 atRestSecretKey 派生（同版本通用，与
+# checkin_Workbuddy.py 一致）。客户端升级后密钥可能变化，解密失败会明确报错。
+WB_EXT_AUTH_REL = Path("CodeBuddyExtension") / "Data" / "Public" / "auth"
+WB_AT_REST_SECRET = "Sik9U5aXhCdwTVEwsEySDOmDoB9r9ntFxHF1fst9LQI="
 
 DEFAULT_EXPORT_FILE = Path(__file__).parent / "workbuddy_secrets.json"
 DEFAULT_STATE_FILE = Path(__file__).parent / "wb_state.json"
@@ -451,6 +460,79 @@ def mask_tokens(accs: list) -> None:
 
 
 # ---- --export：本机读取登录态，生成 Secrets JSON ----
+def _wb_field_aad(key_id: str, suite: int) -> bytes:
+    """复刻 WorkBuddy buildAuthenticatedContextAad（sym-v1，field 级）的字节布局"""
+    return b"".join([
+        b"WB-AAD\x00", b"\x01",
+        struct.pack(">I", len(b"WBEV1")) + b"WBEV1",
+        struct.pack(">I", 6) + b"sym-v1",
+        struct.pack(">I", suite),
+        struct.pack(">I", len(key_id)) + key_id.encode(),
+        bytes([2]),  # _FRAMING_NUM["field"]
+        b"\x00",     # sequence 未定义
+        b"\x00",     # final 未定义
+    ])
+
+
+def _open_wb_field(value):
+    """解密 $wbEncrypted 字段封装；明文值原样返回。失败抛异常。"""
+    if not isinstance(value, dict) or value.get("$wbEncrypted") != 1:
+        return value
+    if value.get("scheme") not in (None, "sym-v1"):
+        raise ValueError(f"不支持的加密方案 {value.get('scheme')}，请重新登录 WorkBuddy")
+    from Crypto.Cipher import AES
+    key = hashlib.sha256(WB_AT_REST_SECRET.encode("utf-8")).digest()
+    key_id = hashlib.sha256(key).hexdigest()[:16]
+    env = json.loads(base64.b64decode(value["envelope"]))
+    if env.get("keyId") != key_id:
+        raise ValueError(f"密钥不匹配（envelope keyId={env.get('keyId')}），"
+                         "WorkBuddy 版本可能已更新")
+    cipher = AES.new(key, AES.MODE_GCM, nonce=base64.b64decode(env["nonce"]))
+    cipher.update(_wb_field_aad(env["keyId"], env["suite"]))
+    plain = cipher.decrypt_and_verify(
+        base64.b64decode(env["ciphertext"]), base64.b64decode(env["authTag"]))
+    return plain.decode("utf-8")
+
+
+def _load_session_ext() -> dict:
+    """回退来源：从 CodeBuddyExtension 的 *.info 会话文件解密 WorkBuddy 登录态。
+    返回第一个可用的会话（单账号导出；多账号见 checkin_Workbuddy.py）。"""
+    auth_dir = Path(os.environ.get("LOCALAPPDATA", "")) / WB_EXT_AUTH_REL
+    if not auth_dir.is_dir():
+        raise FileNotFoundError(f"未找到 {auth_dir}")
+    files = sorted(auth_dir.glob("*.info"))
+    if not files:
+        raise FileNotFoundError(f"{auth_dir} 下没有 .info 会话文件")
+    last_err: Exception | None = None
+    for path in files:
+        try:
+            sess = json.loads(path.read_text(encoding="utf-8"))
+            for section in ("auth", "account"):
+                obj = sess.get(section)
+                if not isinstance(obj, dict):
+                    continue
+                for k, v in list(obj.items()):
+                    if isinstance(v, dict) and v.get("$wbEncrypted") == 1:
+                        obj[k] = _open_wb_field(v)
+            if not sess.get("auth", {}).get("accessToken"):
+                raise ValueError("会话文件中无 accessToken")
+            return sess
+        except Exception as e:  # 换下一个文件试
+            last_err = e
+    raise ValueError(f"解析会话文件失败：{last_err}")
+
+
+def _load_session() -> dict:
+    """读取本机 WorkBuddy 登录态：优先 CodeBuddy CN 的 state.vscdb，
+    找不到/读不了时回退 CodeBuddyExtension 的 *.info 会话文件"""
+    try:
+        return _load_session_vscdb()
+    except Exception as e:
+        print(f"（state.vscdb 读取失败：{e}）")
+        print("（回退读取 CodeBuddyExtension 会话文件）")
+        return _load_session_ext()
+
+
 def _dpapi_decrypt(raw: bytes) -> bytes:
     buf = ctypes.create_string_buffer(raw, len(raw))
 
@@ -546,7 +628,7 @@ def _secret_obj(sess: dict) -> dict:
 
 def export_secrets(out_path: Path) -> int:
     try:
-        sess = _load_session_vscdb()
+        sess = _load_session()
     except Exception as e:
         print(f"读取 WorkBuddy 登录态失败：{e}")
         print("请先安装并登录 WorkBuddy / CodeBuddy CN 客户端后重试")

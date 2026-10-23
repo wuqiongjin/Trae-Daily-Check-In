@@ -1,5 +1,6 @@
 # 敏感文件：切勿提交（含明文 token）
 trae_secrets.json
+workbuddy_secrets.json
 auths.json
 checkin.log
 
